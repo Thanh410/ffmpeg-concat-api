@@ -1,0 +1,13 @@
+# render.yaml - Deploy tự động trên Render.com
+services:
+  - type: web
+    name: ffmpeg-concat-api
+    runtime: docker          # Dùng Dockerfile (có FFmpeg)
+    plan: free               # Free tier
+    region: singapore        # Gần VN nhất
+    envVars:
+      - key: API_KEY
+        generateValue: true  # Render tự generate key ngẫu nhiên
+      - key: PORT
+        value: 3000
+    healthCheckPath: /health
