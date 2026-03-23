@@ -10,26 +10,45 @@ const app = express();
 app.use(express.json({ limit: '10mb' }));
 
 const TMP = '/tmp';
+const OUTPUT_DIR = '/tmp/outputs';
 const API_KEY = process.env.API_KEY || 'your-secret-key';
+const BASE_URL = process.env.BASE_URL || '';
+
+// Create output dir
+if (!fs.existsSync(OUTPUT_DIR)) fs.mkdirSync(OUTPUT_DIR, { recursive: true });
 
 // ─── Auth Middleware ───────────────────────────────────────────────
 app.use((req, res, next) => {
-  if (req.path === '/health') return next();
+  if (req.path === '/health' || req.path.startsWith('/v1/video/file/')) return next();
   const key = req.headers['x-api-key'] || req.headers['authorization']?.replace('Bearer ', '');
-  if (key !== API_KEY) {
-    return res.status(401).json({ error: 'Unauthorized', status: 'failed' });
-  }
+  if (key !== API_KEY) return res.status(401).json({ error: 'Unauthorized' });
   next();
 });
 
-// ─── Health Check ─────────────────────────────────────────────────
+// ─── Health ───────────────────────────────────────────────────────
 app.get('/health', (req, res) => {
   try {
-    const version = execSync('ffmpeg -version').toString().split('\n')[0];
-    res.json({ status: 'ok', ffmpeg: version });
+    const v = execSync('ffmpeg -version').toString().split('\n')[0];
+    res.json({ status: 'ok', ffmpeg: v });
   } catch (e) {
     res.status(500).json({ status: 'error', ffmpeg: 'not found' });
   }
+});
+
+// ─── Serve .mp4 ───────────────────────────────────────────────────
+// GET /v1/video/file/output_abc123.mp4
+app.get('/v1/video/file/:filename', (req, res) => {
+  const { filename } = req.params;
+  if (!filename.endsWith('.mp4') || filename.includes('..') || filename.includes('/')) {
+    return res.status(400).json({ error: 'Invalid filename' });
+  }
+  const filePath = path.join(OUTPUT_DIR, filename);
+  if (!fs.existsSync(filePath)) {
+    return res.status(404).json({ error: 'File not found or expired' });
+  }
+  res.setHeader('Content-Type', 'video/mp4');
+  res.setHeader('Content-Disposition', `inline; filename="${filename}"`);
+  res.sendFile(filePath);
 });
 
 // ─── Download helper ──────────────────────────────────────────────
@@ -37,127 +56,99 @@ function downloadFile(url, destPath) {
   return new Promise((resolve, reject) => {
     const protocol = url.startsWith('https') ? https : http;
     const file = fs.createWriteStream(destPath);
-    
-    const request = protocol.get(url, (response) => {
-      // Follow redirects
-      if (response.statusCode === 301 || response.statusCode === 302) {
+    const req = protocol.get(url, (response) => {
+      if ([301, 302].includes(response.statusCode)) {
         file.close();
         return downloadFile(response.headers.location, destPath).then(resolve).catch(reject);
       }
       if (response.statusCode !== 200) {
         file.close();
-        return reject(new Error(`Download failed: HTTP ${response.statusCode} for ${url}`));
+        return reject(new Error(`HTTP ${response.statusCode} for ${url}`));
       }
       response.pipe(file);
       file.on('finish', () => { file.close(); resolve(); });
     });
-
-    request.on('error', (err) => {
-      fs.unlink(destPath, () => {});
-      reject(err);
-    });
-    request.setTimeout(120000, () => {
-      request.destroy();
-      reject(new Error(`Download timeout: ${url}`));
-    });
+    req.on('error', (err) => { fs.unlink(destPath, () => {}); reject(err); });
+    req.setTimeout(120000, () => { req.destroy(); reject(new Error(`Timeout: ${url}`)); });
   });
 }
 
-// ─── Cleanup helper ───────────────────────────────────────────────
 function cleanup(...files) {
-  files.forEach(f => {
-    if (f && fs.existsSync(f)) {
-      try { fs.unlinkSync(f); } catch (_) {}
-    }
-  });
+  files.forEach(f => { if (f && fs.existsSync(f)) { try { fs.unlinkSync(f); } catch (_) {} } });
+}
+
+function scheduleDelete(filePath, minutes = 30) {
+  setTimeout(() => {
+    cleanup(filePath);
+    console.log(`[Cleanup] Deleted: ${path.basename(filePath)}`);
+  }, minutes * 60 * 1000);
 }
 
 // ─── POST /v1/video/concatenate ───────────────────────────────────
-// Body: { "video_urls": [{"video_url": "..."}, {"video_url": "..."}] }
-// hoặc: { "video_urls": ["url1", "url2"] }
 app.post('/v1/video/concatenate', async (req, res) => {
   const { video_urls } = req.body;
-
   if (!video_urls || !Array.isArray(video_urls) || video_urls.length < 2) {
-    return res.status(400).json({ error: 'video_urls must be array with at least 2 items' });
+    return res.status(400).json({ error: 'Need at least 2 video_urls' });
   }
 
-  // Normalize: support cả [{video_url: "..."}, ...] và ["url1", ...]
-  const urls = video_urls.map(item =>
-    typeof item === 'string' ? item : item.video_url
-  ).filter(Boolean);
-
+  const urls = video_urls.map(i => typeof i === 'string' ? i : i.video_url).filter(Boolean);
   const jobId = randomUUID().split('-')[0];
   const tmpFiles = [];
   const listPath = path.join(TMP, `list_${jobId}.txt`);
-  const outputPath = path.join(TMP, `output_${jobId}.mp4`);
+  const filename = `output_${jobId}.mp4`;
+  const outputPath = path.join(OUTPUT_DIR, filename);
 
-  console.log(`[${jobId}] Starting concatenation of ${urls.length} videos`);
+  console.log(`[${jobId}] Concat ${urls.length} videos`);
 
   try {
-    // Step 1: Download all videos in parallel
-    console.log(`[${jobId}] Downloading ${urls.length} videos...`);
-    const downloadPromises = urls.map((url, i) => {
-      const filePath = path.join(TMP, `input_${jobId}_${i}.mp4`);
-      tmpFiles.push(filePath);
-      return downloadFile(url, filePath).then(() => {
-        console.log(`[${jobId}] ✓ Downloaded video ${i + 1}/${urls.length}`);
-      });
-    });
-    await Promise.all(downloadPromises);
+    // Download all in parallel
+    await Promise.all(urls.map((url, i) => {
+      const p = path.join(TMP, `input_${jobId}_${i}.mp4`);
+      tmpFiles.push(p);
+      return downloadFile(url, p).then(() => console.log(`[${jobId}] Downloaded ${i+1}/${urls.length}`));
+    }));
 
-    // Step 2: Write FFmpeg concat list
-    const listContent = tmpFiles.map(f => `file '${f}'`).join('\n');
-    fs.writeFileSync(listPath, listContent);
-    console.log(`[${jobId}] Concat list:\n${listContent}`);
-
-    // Step 3: Run FFmpeg
-    const ffmpegCmd = `ffmpeg -f concat -safe 0 -i "${listPath}" -c copy "${outputPath}" -y`;
-    console.log(`[${jobId}] Running: ${ffmpegCmd}`);
-    
+    // FFmpeg concat
+    fs.writeFileSync(listPath, tmpFiles.map(f => `file '${f}'`).join('\n'));
     await new Promise((resolve, reject) => {
-      exec(ffmpegCmd, { timeout: 300000 }, (error, stdout, stderr) => {
-        if (error) {
-          console.error(`[${jobId}] FFmpeg error:`, stderr);
-          reject(new Error(`FFmpeg failed: ${stderr.slice(-500)}`));
-        } else {
-          resolve();
-        }
-      });
+      exec(
+        `ffmpeg -f concat -safe 0 -i "${listPath}" -c copy "${outputPath}" -y`,
+        { timeout: 300000 },
+        (err, _, stderr) => err ? reject(new Error(stderr.slice(-500))) : resolve()
+      );
     });
 
-    // Step 4: Read output and return as base64
-    const outputBuffer = fs.readFileSync(outputPath);
-    const base64Video = outputBuffer.toString('base64');
-    const fileSizeMB = (outputBuffer.length / 1024 / 1024).toFixed(2);
-    
-    console.log(`[${jobId}] ✓ Done! Output: ${fileSizeMB} MB`);
+    const mb = (fs.statSync(outputPath).size / 1024 / 1024).toFixed(2);
+
+    // Auto-delete after 30 min
+    scheduleDelete(outputPath, 30);
+
+    // Build URL
+    const host = BASE_URL || `${req.protocol}://${req.get('host')}`;
+    const output_url = `${host}/v1/video/file/${filename}`;
+
+    console.log(`[${jobId}] ✓ ${mb}MB → ${output_url}`);
 
     return res.json({
       status: 'success',
       job_id: jobId,
-      file_size_mb: parseFloat(fileSizeMB),
-      video_count: urls.length,
-      output_base64: base64Video,
-      content_type: 'video/mp4'
+      output_url,        // ⭐ URL trực tiếp có đuôi .mp4
+      filename,
+      file_size_mb: parseFloat(mb),
+      expires_in: '30 minutes'
     });
 
-  } catch (error) {
-    console.error(`[${jobId}] Error:`, error.message);
-    return res.status(500).json({
-      status: 'failed',
-      job_id: jobId,
-      error: error.message
-    });
+  } catch (e) {
+    console.error(`[${jobId}]`, e.message);
+    return res.status(500).json({ status: 'failed', job_id: jobId, error: e.message });
   } finally {
-    cleanup(...tmpFiles, listPath, outputPath);
+    cleanup(...tmpFiles, listPath);
   }
 });
 
-// ─── Start Server ─────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`🎬 FFmpeg Concat API running on port ${PORT}`);
-  console.log(`   Health: http://localhost:${PORT}/health`);
-  console.log(`   Concat: POST http://localhost:${PORT}/v1/video/concatenate`);
+  console.log(`🎬 FFmpeg API :${PORT}`);
+  console.log(`   POST /v1/video/concatenate → output_url.mp4`);
+  console.log(`   GET  /v1/video/file/:name  → serve mp4`);
 });
